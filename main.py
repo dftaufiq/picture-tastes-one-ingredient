@@ -1,446 +1,382 @@
 #!/usr/bin/env python3
-"""One perfect strawberry, rendered in pure Python stdlib.
+"""One perfect strawberry, rendered in code.
 
-Entry for make.fun's "The picture that tastes of one ingredient":
-a single strawberry, glossy with water droplets and seeds, on a warm
-cream backdrop. No network, no third-party packages: a hand-written
-rasterizer (spans, gradients, soft shadows, specular highlights) plus
-a minimal PNG encoder (zlib).
+Pure Python 3.13 stdlib, no network, no third-party packages. A
+hand-written rasterizer draws a single glossy strawberry -- ripe red
+body, pale gold seeds, green calyx leaves, a leaning stem, water
+droplets and a soft drop shadow -- on a warm cream background, and a
+minimal PNG encoder (zlib) writes it out.
 
-Writes /output/entry.png (1024x1024).
+Run:  python3 main.py
+Out:  /output/entry.png  (1024 x 1024, <= 1 MiB)
 """
 
 import math
 import os
+import random
 import struct
 import zlib
 
 W = H = 1024
 OUT = "/output/entry.png"
 
-CX = 512
-Y0, Y1 = 315, 895          # body top, tip
-WMAX = 252                 # max half-width of the berry
+# ---------------------------------------------------------------- canvas
 
-# ---- palette -------------------------------------------------------
-BG_C = (253, 246, 231)     # warm cream, centre
-BG_M = (247, 232, 200)     # warm cream, mid
-BG_E = (232, 206, 158)     # warm cream, edge
-RED_HI = (255, 118, 92)    # highlight tint
-RED_MID = (233, 34, 40)    # ripe red
-RED_DEEP = (158, 12, 28)   # deep red edge
-GREEN_D = (34, 88, 28)
-GREEN_M = (74, 148, 52)
-GREEN_L = (122, 190, 78)
-SEED_TOP = (255, 226, 152)
-SEED_BOT = (238, 186, 88)
-SEED_EDGE = (198, 146, 58)
+def new_canvas():
+    return [bytearray(W * 3) for _ in range(H)]
 
 
-def clamp(v, lo, hi):
-    return lo if v < lo else hi if v > hi else v
+def lerp(a, b, t):
+    return a + (b - a) * t
 
 
-def mix3(a, b, t):
-    return (a[0] + (b[0] - a[0]) * t,
-            a[1] + (b[1] - a[1]) * t,
-            a[2] + (b[2] - a[2]) * t)
+def clamp01(v):
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 
-def half_width(y):
-    """Half-width of the strawberry body at row y (rounded shoulders,
-    tapering to a soft point)."""
-    t = (y - Y0) / (Y1 - Y0)
-    if t <= 0.0:
-        return WMAX * 0.62
-    if t >= 1.0:
-        return 0.0
-    s = t / 0.18
-    if s > 1.0:
-        s = 1.0
-    shoulder = 0.55 + 0.45 * (s * s * (3.0 - 2.0 * s))
-    return WMAX * shoulder * (1.0 - t ** 2.35) ** 0.58
+def mix3(c1, c2, t):
+    return (int(lerp(c1[0], c2[0], t)),
+            int(lerp(c1[1], c2[1], t)),
+            int(lerp(c1[2], c2[2], t)))
 
 
-def body_rgb(x, y, w):
-    """Ripe-red shading for a body pixel: bright centre-left, deep red
-    edges, darker tip, warm rim light on the right."""
-    nx = (x - CX) / w
-    ny = (y - Y0) / (Y1 - Y0)
-    r = math.sqrt(nx * nx + ny * ny * 0.9)
-    te = r * r * (3.0 - 2.0 * r) if r < 1.0 else 1.0
-    cr, cg, cb = mix3(RED_MID, RED_DEEP, te)
-    # soft highlight, upper-left
-    dhx = (nx + 0.38) / 0.62
-    dhy = (ny - 0.28) / 0.42
-    hl = math.exp(-(dhx * dhx + dhy * dhy))
-    a = hl * 0.72
-    cr += (255 - cr) * a
-    cg += (118 - cg) * a
-    cb += (92 - cb) * a
-    # darken toward the tip
-    dark = 1.0 - 0.16 * ny * ny
-    cr *= dark
-    cg *= dark
-    cb *= dark
-    # warm rim light on the right edge
-    rim = math.exp(-((nx - 0.97) * 6.0) ** 2) * (1.0 - 0.45 * ny)
-    cr += (255 - cr) * rim * 0.30
-    cg += (150 - cg) * rim * 0.30
-    cb += (100 - cb) * rim * 0.30
-    return (int(clamp(cr, 0, 255)),
-            int(clamp(cg, 0, 255)),
-            int(clamp(cb, 0, 255)))
+def set_px(buf, x, y, color):
+    if 0 <= x < W and 0 <= y < H:
+        row = buf[y]
+        i = x * 3
+        row[i], row[i + 1], row[i + 2] = color
 
 
-# ---- primitive fills -----------------------------------------------
+def blend_px(buf, x, y, color, alpha):
+    """Blend color over the pixel at (x, y); alpha 0..1."""
+    if 0 <= x < W and 0 <= y < H:
+        row = buf[y]
+        i = x * 3
+        row[i] = int(lerp(row[i], color[0], alpha))
+        row[i + 1] = int(lerp(row[i + 1], color[1], alpha))
+        row[i + 2] = int(lerp(row[i + 2], color[2], alpha))
 
-def fill_circle(rows, cx, cy, r, rgb, alpha=1.0):
-    cx = int(round(cx))
-    cy = int(round(cy))
-    r = int(round(r))
+
+def stamp_disc(buf, cx, cy, r, color):
+    """Filled circle, integer centre/radius."""
+    r = int(r)
     if r <= 0:
         return
-    R, G, B = int(rgb[0]), int(rgb[1]), int(rgb[2])
-    for dy in range(-r, r + 1):
-        y = cy + dy
-        if y < 0 or y >= H:
+    x0 = max(0, cx - r)
+    x1 = min(W - 1, cx + r)
+    y0 = max(0, cy - r)
+    y1 = min(H - 1, cy + r)
+    rr = r * r
+    for yy in range(y0, y1 + 1):
+        dy = yy - cy
+        dx = int(math.sqrt(max(0, rr - dy * dy)))
+        row = buf[yy]
+        xa = max(0, cx - dx)
+        xb = min(W - 1, cx + dx)
+        for xx in range(xa, xb + 1):
+            i = xx * 3
+            row[i], row[i + 1], row[i + 2] = color
+
+
+def stamp_ellipse(buf, cx, cy, rx, ry, color):
+    """Filled axis-aligned ellipse (float radii)."""
+    x0 = max(0, int(cx - rx))
+    x1 = min(W - 1, int(cx + rx) + 1)
+    y0 = max(0, int(cy - ry))
+    y1 = min(H - 1, int(cy + ry) + 1)
+    for yy in range(y0, y1 + 1):
+        dy = (yy - cy) / ry
+        t = 1.0 - dy * dy
+        if t <= 0:
             continue
-        dx = int(math.sqrt(r * r - dy * dy))
-        row = rows[y]
-        for x in range(cx - dx, cx + dx + 1):
-            if x < 0 or x >= W:
-                continue
-            i3 = x * 3
-            if alpha >= 1.0:
-                row[i3] = R
-                row[i3 + 1] = G
-                row[i3 + 2] = B
-            else:
-                row[i3] = int(row[i3] + (R - row[i3]) * alpha)
-                row[i3 + 1] = int(row[i3 + 1] + (G - row[i3 + 1]) * alpha)
-                row[i3 + 2] = int(row[i3 + 2] + (B - row[i3 + 2]) * alpha)
+        dx = rx * math.sqrt(t)
+        row = buf[yy]
+        xa = max(0, int(cx - dx))
+        xb = min(W - 1, int(cx + dx))
+        for xx in range(xa, xb + 1):
+            i = xx * 3
+            row[i], row[i + 1], row[i + 2] = color
 
 
-def fill_ellipse(rows, cx, cy, rx, ry, rgb, alpha=1.0):
-    cx = int(round(cx))
-    cy = int(round(cy))
-    rx = int(round(rx))
-    ry = int(round(ry))
-    if rx <= 0 or ry <= 0:
-        return
-    R, G, B = int(rgb[0]), int(rgb[1]), int(rgb[2])
-    for dy in range(-ry, ry + 1):
-        y = cy + dy
-        if y < 0 or y >= H:
+def stamp_ellipse_blend(buf, cx, cy, rx, ry, color, alpha):
+    x0 = max(0, int(cx - rx))
+    x1 = min(W - 1, int(cx + rx) + 1)
+    y0 = max(0, int(cy - ry))
+    y1 = min(H - 1, int(cy + ry) + 1)
+    for yy in range(y0, y1 + 1):
+        dy = (yy - cy) / ry
+        t = 1.0 - dy * dy
+        if t <= 0:
             continue
-        f = 1.0 - (dy / ry) ** 2
-        if f <= 0.0:
-            continue
-        dx = int(rx * math.sqrt(f))
-        row = rows[y]
-        for x in range(cx - dx, cx + dx + 1):
-            if x < 0 or x >= W:
-                continue
-            i3 = x * 3
-            if alpha >= 1.0:
-                row[i3] = R
-                row[i3 + 1] = G
-                row[i3 + 2] = B
-            else:
-                row[i3] = int(row[i3] + (R - row[i3]) * alpha)
-                row[i3 + 1] = int(row[i3 + 1] + (G - row[i3 + 1]) * alpha)
-                row[i3 + 2] = int(row[i3 + 2] + (B - row[i3 + 2]) * alpha)
+        dx = rx * math.sqrt(t)
+        row = buf[yy]
+        xa = max(0, int(cx - dx))
+        xb = min(W - 1, int(cx + dx))
+        for xx in range(xa, xb + 1):
+            i = xx * 3
+            row[i] = int(lerp(row[i], color[0], alpha))
+            row[i + 1] = int(lerp(row[i + 1], color[1], alpha))
+            row[i + 2] = int(lerp(row[i + 2], color[2], alpha))
 
 
-def soft_ellipse(rows, cx, cy, rx, ry, rgb, max_alpha):
-    """Radial-falloff ellipse (soft shadow)."""
-    R, G, B = rgb
-    for dy in range(-ry, ry + 1):
-        y = cy + dy
-        if y < 0 or y >= H:
-            continue
-        f = 1.0 - (dy / ry) ** 2
-        if f <= 0.0:
-            continue
-        dx = int(rx * math.sqrt(f))
-        row = rows[y]
-        for x in range(cx - dx, cx + dx + 1):
-            if x < 0 or x >= W:
-                continue
-            q = 1.0 - ((x - cx) / rx) ** 2 - (dy / ry) ** 2
-            if q <= 0.0:
-                continue
-            a = max_alpha * q
-            i3 = x * 3
-            row[i3] = int(row[i3] + (R - row[i3]) * a)
-            row[i3 + 1] = int(row[i3 + 1] + (G - row[i3 + 1]) * a)
-            row[i3 + 2] = int(row[i3 + 2] + (B - row[i3 + 2]) * a)
+# ---------------------------------------------------------------- background
+
+CREAM_CENTRE = (251, 239, 212)
+CREAM_EDGE = (231, 212, 172)
 
 
-# ---- strawberry parts ----------------------------------------------
-
-LEAVES = [(-62, 150), (-32, 188), (0, 208), (32, 188), (62, 150)]
-
-
-def draw_leaf(rows, ang_deg, length):
-    a = math.radians(ang_deg)
-    dx_dir = math.sin(a)
-    dy_dir = -math.cos(a)
-    bx, by = 512.0, 342.0
-    cos_a = max(0.45, abs(math.cos(a)))
-    n = int(length)
-    for i in range(n + 1):
-        s = i / n
-        px = bx + dx_dir * s * length
-        py = by + dy_dir * s * length
-        half = 25.0 * math.sin(math.pi * (s ** 0.8)) * (1.0 - 0.25 * s) / cos_a
-        if half < 0.6:
-            continue
-        y = int(round(py))
-        if y < 0 or y >= H:
-            continue
-        c = mix3(GREEN_D, GREEN_L, s)
-        row = rows[y]
-        x0 = int(px - half - 2)
-        x1 = int(px + half + 2)
-        for x in range(max(0, x0), min(W, x1 + 1)):
-            i3 = x * 3
-            row[i3] = GREEN_D[0]
-            row[i3 + 1] = GREEN_D[1]
-            row[i3 + 2] = GREEN_D[2]
-        x0 = int(px - half)
-        x1 = int(px + half)
-        for x in range(max(0, x0), min(W, x1 + 1)):
-            i3 = x * 3
-            row[i3] = int(c[0])
-            row[i3 + 1] = int(c[1])
-            row[i3 + 2] = int(c[2])
-
-
-def draw_leaf_veins(rows):
-    for ang_deg, length in LEAVES:
-        a = math.radians(ang_deg)
-        dx_dir = math.sin(a)
-        dy_dir = -math.cos(a)
-        for i in range(int(length * 0.15), int(length * 0.9)):
-            s = i / length
-            px = 512.0 + dx_dir * s * length
-            py = 342.0 + dy_dir * s * length
-            x = int(round(px))
-            y = int(round(py))
-            if 0 <= x < W and 0 <= y < H:
-                row = rows[y]
-                for xx in (x - 1, x):
-                    if 0 <= xx < W:
-                        i3 = xx * 3
-                        row[i3] = int(row[i3] * 0.35 + 150 * 0.65)
-                        row[i3 + 1] = int(row[i3 + 1] * 0.35 + 210 * 0.65)
-                        row[i3 + 2] = int(row[i3 + 2] * 0.35 + 110 * 0.65)
-
-
-def draw_stem(rows):
-    for k in range(41):
-        t = k / 40.0
-        x = 512 + 34 * t + 26 * t * t
-        y = 340 - 104 * t
-        r = 7.0 - 2.5 * t
-        fill_circle(rows, x, y, r, (96, 122, 46))
-        fill_circle(rows, x - 2, y, max(1, r * 0.45), (150, 175, 90), 0.7)
-
-
-def draw_seed(rows, sx, sy, w, nx):
-    rx = max(4.5, min(10.0, 0.035 * w))
-    ry = rx * 1.5
-    rot = nx * 0.45
-    shear = math.sin(rot)
-    # soft shadow under the seed
-    fill_ellipse(rows, sx + 2, sy + 3, rx, ry, (120, 18, 24), 0.45)
-    # seed body: pale gold, lighter on top, darker rim
-    ry_i = int(ry) + 1
-    for dy in range(-ry_i, ry_i + 1):
-        y = sy + dy
-        if y < 0 or y >= H:
-            continue
-        f = 1.0 - (dy / ry) ** 2
-        if f <= 0.0:
-            continue
-        dx = rx * math.sqrt(f)
-        ccx = sx + dy * shear
-        t = (dy / ry + 1.0) / 2.0
-        cr, cg, cb = mix3(SEED_TOP, SEED_BOT, t)
-        row = rows[y]
-        x0 = int(ccx - dx)
-        x1 = int(ccx + dx)
-        for x in range(max(0, x0), min(W, x1 + 1)):
-            edge = abs(x - ccx) / dx if dx > 0 else 0.0
-            if edge > 0.82:
-                r2, g2, b2 = SEED_EDGE
-            else:
-                r2, g2, b2 = cr, cg, cb
-            i3 = x * 3
-            row[i3] = int(r2)
-            row[i3 + 1] = int(g2)
-            row[i3 + 2] = int(b2)
-    # tiny highlight
-    fill_circle(rows, sx - rx * 0.35, sy - ry * 0.35, 1.8, (255, 255, 255), 0.85)
-
-
-def draw_seeds(rows):
-    rows_ny = [0.10, 0.22, 0.34, 0.46, 0.58, 0.70, 0.82, 0.92]
-    for ri, ny in enumerate(rows_ny):
-        y = int(Y0 + ny * (Y1 - Y0))
-        w = half_width(y)
-        off = 0.13 if ri % 2 else 0.0
-        nx = -0.78 + off
-        while nx <= 0.78:
-            # deterministic jitter so the rows don't look machine-gridded
-            h1 = math.sin(ri * 127.1 + nx * 311.7) * 43758.5453
-            h2 = math.sin(ri * 269.5 + nx * 183.3) * 28001.8384
-            jx = (h1 - math.floor(h1) - 0.5) * 10.0
-            jy = (h2 - math.floor(h2) - 0.5) * 7.0
-            sx = int(CX + nx * w + jx)
-            draw_seed(rows, sx, int(y + jy), w, nx)
-            nx += 0.26
-
-
-DROPS = [(430, 470, 13), (600, 500, 16), (505, 615, 11), (645, 430, 9),
-         (375, 590, 10), (560, 705, 12), (465, 545, 8), (625, 640, 9),
-         (395, 470, 7)]
-
-
-def draw_droplets(rows):
-    for (x, y, r) in DROPS:
-        w = half_width(y)
-        if abs(x - CX) > w * 0.88:
-            continue
-        base = body_rgb(x, y, w)
-        fill_circle(rows, x, y, r + 1, (150, 20, 30), 0.25)
-        fill_circle(rows, x, y, r, mix3(base, (255, 255, 255), 0.18))
-        fill_circle(rows, x - r * 0.25, y - r * 0.30, r * 0.55,
-                    mix3(base, (255, 255, 255), 0.35), 0.8)
-        fill_circle(rows, x - r * 0.35, y - r * 0.42, r * 0.22,
-                    (255, 255, 255), 0.95)
-
-
-# ---- render ----------------------------------------------------------
-
-def render():
-    rows = [bytearray(W * 3) for _ in range(H)]
-
-    # warm cream radial background (lookup table by radius)
-    bg = []
-    for i in range(1024):
-        t = i / 1023.0
-        if t < 0.55:
-            c = mix3(BG_C, BG_M, t / 0.55)
-        else:
-            c = mix3(BG_M, BG_E, (t - 0.55) / 0.45)
-        bg.append((int(c[0]), int(c[1]), int(c[2])))
-    isqrt = math.isqrt
+def paint_background(buf):
     for y in range(H):
         dy = y - 470
-        dy2 = dy * dy
-        row = rows[y]
+        row = buf[y]
         for x in range(W):
             dx = x - 512
-            idx = isqrt(dx * dx + dy2) * 1023 // 760
-            if idx > 1023:
-                idx = 1023
-            c = bg[idx]
-            i3 = x * 3
-            row[i3] = c[0]
-            row[i3 + 1] = c[1]
-            row[i3 + 2] = c[2]
+            t = (dx * dx + dy * dy) / 720.0 ** 2
+            if t > 1.0:
+                t = 1.0
+            # ease the falloff so the centre stays bright and clean
+            t = t * (0.55 + 0.45 * t)
+            i = x * 3
+            row[i] = int(lerp(CREAM_CENTRE[0], CREAM_EDGE[0], t))
+            row[i + 1] = int(lerp(CREAM_CENTRE[1], CREAM_EDGE[1], t))
+            row[i + 2] = int(lerp(CREAM_CENTRE[2], CREAM_EDGE[2], t))
 
-    # soft drop shadow under the berry
-    soft_ellipse(rows, 512, 905, 275, 50, (88, 44, 20), 0.30)
 
-    # strawberry body (domed top edge so the shoulders curve, not flat)
-    w_top = half_width(Y0)
-    x_lo = int(CX - WMAX)
-    ystart = []
-    for x in range(x_lo, int(CX + WMAX) + 1):
-        u = (x - CX) / w_top
-        ystart.append(Y0 + 34 * u * u if abs(u) <= 1.0 else Y0 + 34)
-    for y in range(Y0, Y1):
-        w = half_width(y)
-        x0 = int(CX - w)
-        x1 = int(CX + w)
-        row = rows[y]
-        for x in range(x0, x1 + 1):
-            if y < ystart[x - x_lo]:
+def paint_shadow(buf):
+    # Soft elliptical drop shadow under the berry.
+    cx, cy, rx, ry = 512, 932, 305, 40
+    for y in range(cy - ry, cy + ry + 1):
+        dy = (y - cy) / ry
+        for x in range(cx - rx, cx + rx + 1):
+            dx = (x - cx) / rx
+            q = 1.0 - dx * dx - dy * dy
+            if q <= 0:
                 continue
-            r, g, b = body_rgb(x, y, w)
-            i3 = x * 3
-            row[i3] = r
-            row[i3 + 1] = g
-            row[i3 + 2] = b
+            a = 0.30 * q * q
+            blend_px(buf, x, y, (96, 62, 32), a)
 
-    # soft specular sheen, upper-left of the body
-    for dy in range(-210, 211):
-        y = 435 + dy
-        if y < 0 or y >= H:
+
+# ---------------------------------------------------------------- strawberry body
+
+BODY_CX = 512
+BODY_TOP = 330
+BODY_BOT = 912
+BODY_W = 288
+
+DEEP_RED = (146, 16, 26)
+MID_RED = (213, 41, 40)
+BRIGHT_RED = (247, 98, 66)
+
+
+def body_half_width(y):
+    """Half-width of the berry at row y (0 outside the berry)."""
+    if y < BODY_TOP or y > BODY_BOT:
+        return 0.0
+    t = (y - BODY_TOP) / (BODY_BOT - BODY_TOP)
+    # Domed shoulders: rise from a narrow rounded crown to full width,
+    # then taper to a rounded point.
+    s = t / 0.22
+    if s > 1.0:
+        s = 1.0
+    shoulder = 0.32 + 0.68 * (s * s * (3.0 - 2.0 * s))
+    taper = math.sqrt(max(0.0, 1.0 - t ** 2.6))
+    return BODY_W * shoulder * taper
+
+
+def paint_body(buf):
+    for y in range(BODY_TOP, BODY_BOT + 1):
+        w = body_half_width(y)
+        if w < 1.0:
             continue
-        for dx in range(-210, 211):
-            x = 425 + dx
-            if x < 0 or x >= W:
+        vy = (y - BODY_TOP) / (BODY_BOT - BODY_TOP)
+        row = buf[y]
+        x0 = int(BODY_CX - w)
+        x1 = int(BODY_CX + w)
+        for x in range(x0, x1 + 1):
+            nx = (x - BODY_CX) / w
+            edge = 1.0 - nx * nx            # 1 centre, 0 at the rim
+            # Warm light from the upper left.
+            hx = (x - 428) / 165.0
+            hy = (y - 455) / 185.0
+            hl = 1.0 - (hx * hx + hy * hy)
+            if hl < 0.0:
+                hl = 0.0
+            hl2 = hl * hl
+            t = 0.22 + 0.62 * edge + 0.55 * hl2 - 0.30 * vy
+            t = clamp01(t)
+            if t < 0.5:
+                r, g, b = mix3(DEEP_RED, MID_RED, t * 2.0)
+            else:
+                r, g, b = mix3(MID_RED, BRIGHT_RED, (t - 0.5) * 2.0)
+            # Broad soft specular sheen, upper left.
+            sheen = hl2 * hl2 * 55.0
+            r = min(255, int(r + sheen))
+            g = min(255, int(g + sheen * 0.55))
+            b = min(255, int(b + sheen * 0.35))
+            i = x * 3
+            row[i], row[i + 1], row[i + 2] = r, g, b
+
+
+# ---------------------------------------------------------------- seeds
+
+SEED_GOLD = (247, 220, 146)
+SEED_RIM = (178, 128, 56)
+SEED_LITE = (255, 243, 196)
+SEED_SHADOW = (118, 18, 24)
+
+
+def paint_seeds(buf):
+    rng = random.Random(20261123)
+    y = 388
+    row_idx = 0
+    while y < 862:
+        w = body_half_width(y)
+        vy = (y - BODY_TOP) / (BODY_BOT - BODY_TOP)
+        scale = 1.06 - 0.52 * vy
+        step = 46.0 * scale
+        n = int(w * 1.62 / step)
+        offset = (step * 0.5) if (row_idx % 2) else 0.0
+        for k in range(-n, n + 1):
+            cx = BODY_CX + k * step + offset + rng.uniform(-7, 7)
+            cy = y + rng.uniform(-5, 5)
+            if abs(cx - BODY_CX) > w * 0.86:
                 continue
-            d = math.sqrt(dx * dx + dy * dy)
-            if d >= 210:
-                continue
-            w = half_width(y)
-            if abs(x - CX) > w:
-                continue
-            a = 0.28 * (1.0 - d / 210.0) ** 2
-            row = rows[y]
-            i3 = x * 3
-            row[i3] = int(row[i3] + (255 - row[i3]) * a)
-            row[i3 + 1] = int(row[i3 + 1] + (240 - row[i3 + 1]) * a)
-            row[i3 + 2] = int(row[i3 + 2] + (225 - row[i3 + 2]) * a)
-
-    # stem, calyx crown, leaves
-    draw_stem(rows)
-    fill_ellipse(rows, 512, 344, 58, 26, (46, 104, 36))
-    fill_ellipse(rows, 512, 336, 34, 15, GREEN_M)
-    for ang, ln in LEAVES:
-        draw_leaf(rows, ang, ln)
-    draw_leaf_veins(rows)
-
-    # seeds and water droplets
-    draw_seeds(rows)
-    draw_droplets(rows)
-    return rows
+            rx = 4.6 * scale
+            ry = 7.6 * scale
+            # Tiny dark pocket under the seed, then rim, then gold.
+            stamp_ellipse(buf, cx + 1.5, cy + 2.0, rx + 1.0, ry + 1.0, SEED_SHADOW)
+            stamp_ellipse(buf, cx, cy, rx, ry, SEED_RIM)
+            stamp_ellipse(buf, cx, cy - 0.5, rx - 1.2, ry - 1.6, SEED_GOLD)
+            stamp_disc(buf, int(cx - 1.5), int(cy - 2.5), max(1, int(1.6 * scale)), SEED_LITE)
+        y += int(47 * scale)
+        row_idx += 1
 
 
-# ---- PNG encoder -----------------------------------------------------
+# ---------------------------------------------------------------- droplets
 
-def encode_png(rows):
+def paint_droplets(buf):
+    rng = random.Random(77)
+    spots = []
+    tries = 0
+    while len(spots) < 9 and tries < 300:
+        tries += 1
+        x = rng.uniform(300, 724)
+        y = rng.uniform(390, 830)
+        w = body_half_width(int(y))
+        if w < 10 or abs(x - BODY_CX) > w * 0.78:
+            continue
+        if any((x - sx) ** 2 + (y - sy) ** 2 < 2600 for sx, sy, _ in spots):
+            continue
+        spots.append((x, y, rng.uniform(6.5, 13.0)))
+    for cx, cy, r in spots:
+        # Glassy bead: pale cool tint over the red, bright sparkle.
+        stamp_ellipse_blend(buf, cx, cy, r, r, (226, 236, 246), 0.42)
+        stamp_ellipse_blend(buf, cx, cy + r * 0.45, r * 0.85, r * 0.4,
+                            (120, 36, 44), 0.30)
+        stamp_disc(buf, int(cx - r * 0.34), int(cy - r * 0.38),
+                   max(1, int(r * 0.30)), (255, 255, 255))
+
+
+# ---------------------------------------------------------------- calyx, stem, leaves
+
+LEAF_DARK = (30, 100, 36)
+LEAF_MID = (58, 148, 62)
+LEAF_LITE = (150, 206, 118)
+CAP_GREEN = (26, 92, 32)
+STEM_GREEN = (104, 126, 54)
+
+
+def paint_stem(buf):
+    # Leaning stem, drawn first so the leaves cover its base.
+    x0, y0, x1, y1 = 512, 348, 550, 206
+    steps = 26
+    for i in range(steps + 1):
+        t = i / steps
+        cx = int(lerp(x0, x1, t))
+        cy = int(lerp(y0, y1, t))
+        r = lerp(9.5, 5.0, t)
+        stamp_disc(buf, cx, cy, r, STEM_GREEN)
+    # Lighter edge on the sun side.
+    for i in range(steps + 1):
+        t = i / steps
+        cx = int(lerp(x0, x1, t)) - 2
+        cy = int(lerp(y0, y1, t))
+        stamp_disc(buf, cx, cy, max(1, int(lerp(3.0, 1.5, t))), (150, 168, 96))
+
+
+def paint_leaf(buf, angle_deg, length):
+    """One pointed leaf fanning from the calyx centre."""
+    base_x, base_y = 512, 352
+    ang = math.radians(angle_deg - 90.0)  # 0 deg = straight up
+    dx = math.cos(ang)
+    dy = math.sin(ang)
+    # Perpendicular for the slight outward curl.
+    px, py = -dy, dx
+    steps = 42
+    for i in range(steps + 1):
+        s = i / steps
+        curl = 14.0 * s * s
+        cx = base_x + dx * length * s + px * curl
+        cy = base_y + dy * length * s + py * curl
+        half = 23.0 * math.sin(math.pi * (s ** 0.75)) ** 0.9
+        if half < 1.0:
+            half = 1.0
+        col = mix3(LEAF_DARK, LEAF_MID, s)
+        stamp_disc(buf, int(cx), int(cy), half, col)
+    # Centre vein, lighter green, along the spine.
+    for i in range(2, steps):
+        s = i / steps
+        curl = 14.0 * s * s
+        cx = base_x + dx * length * s + px * curl
+        cy = base_y + dy * length * s + py * curl
+        stamp_disc(buf, int(cx), int(cy), 2, LEAF_LITE)
+
+
+def paint_calyx(buf):
+    # Five leaves: outer pair low and wide, inner trio upright.
+    for angle, length in ((-64, 148), (-33, 182), (0, 198),
+                         (33, 182), (64, 148)):
+        paint_leaf(buf, angle, length)
+    # Cap disc where the leaves meet the berry.
+    stamp_ellipse(buf, 512, 350, 56, 17, CAP_GREEN)
+    stamp_ellipse(buf, 512, 347, 44, 11, (38, 118, 44))
+
+
+# ---------------------------------------------------------------- PNG encoder
+
+def chunk(tag, data):
+    out = struct.pack(">I", len(data)) + tag + data
+    out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return out
+
+
+def write_png(buf, path):
     raw = bytearray()
-    for row in rows:
-        raw.append(0)  # filter: None
+    for row in buf:
+        raw.append(0)  # filter: none
         raw += row
-    comp = zlib.compress(bytes(raw), 9)
-
-    def chunk(tag, data):
-        c = tag + data
-        return (struct.pack(">I", len(data)) + c +
-                struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF))
-
-    out = bytearray(b"\x89PNG\r\n\x1a\n")
-    out += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    out += chunk(b"IDAT", comp)
-    out += chunk(b"IEND", b"")
-    return bytes(out)
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", ihdr)
+    png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += chunk(b"IEND", b"")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(png)
+    return len(png)
 
 
 def main():
-    rows = render()
-    png = encode_png(rows)
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "wb") as f:
-        f.write(png)
-    print("wrote %s: %dx%d, %d bytes" % (OUT, W, H, len(png)))
+    buf = new_canvas()
+    paint_background(buf)
+    paint_shadow(buf)
+    paint_stem(buf)
+    paint_body(buf)
+    paint_seeds(buf)
+    paint_droplets(buf)
+    paint_calyx(buf)
+    size = write_png(buf, OUT)
+    print(f"wrote {OUT}: {W}x{H}, {size} bytes")
 
 
 if __name__ == "__main__":
